@@ -1,0 +1,422 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\PurchaseOrder;
+use App\Models\MaterialRequest;
+use App\Models\Invoice;
+use App\Models\InvoiceItem;
+use App\Services\StockService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+
+class PurchaseOrderController extends Controller
+{
+    /**
+     * Get all purchase orders
+     */
+    public function index(Request $request)
+    {
+        $this->authorize('viewAny', PurchaseOrder::class);
+        $query = PurchaseOrder::with(['project', 'vendor', 'materialRequest', 'items.material', 'createdBy']);
+
+        // Filter by project if specified
+        if ($request->has('project_id')) {
+            $query->where('project_id', $request->project_id);
+        }
+
+        // Filter by status if specified
+        if ($request->has('status')) {
+            $query->where('status', $request->status);
+        }
+
+        $purchaseOrders = $query->orderBy('created_at', 'desc')->get();
+
+        return response()->json([
+            'success' => true,
+            'data' => $purchaseOrders
+        ]);
+    }
+
+    /**
+     * Get single purchase order details
+     */
+    public function show($id)
+    {
+        $purchaseOrder = PurchaseOrder::with([
+            'project',
+            'vendor',
+            'materialRequest.items.material',
+            'items.material',
+            'createdBy'
+        ])->findOrFail($id);
+
+        $this->authorize('view', $purchaseOrder);
+
+        return response()->json([
+            'success' => true,
+            'data' => $purchaseOrder
+        ]);
+    }
+
+    /**
+     * Create new purchase order
+     */
+    public function store(Request $request)
+    {
+        $this->authorize('create', PurchaseOrder::class);
+
+        $validated = $request->validate([
+            'project_id' => 'required|exists:projects,id',
+            'vendor_id' => 'required|exists:vendors,id',
+            'material_request_id' => 'nullable|exists:material_requests,id',
+            'items' => 'required|array|min:1',
+            'items.*.material_id' => 'required|exists:materials,id',
+            'items.*.quantity' => 'required|numeric|min:0.01',
+            'items.*.unit' => 'required|string',
+            'items.*.rate' => 'required|numeric|min:0',
+        ]);
+
+        try {
+            DB::beginTransaction();
+
+            // PHASE 2: Validate GST/Non-GST separation
+            $materialIds = array_column($validated['items'], 'material_id');
+            $materials = \App\Models\Material::whereIn('id', $materialIds)->get()->keyBy('id');
+            
+            $gstTypes = [];
+            foreach ($materialIds as $materialId) {
+                $material = $materials->get($materialId);
+                if (!$material) {
+                    throw new \Exception("Material ID {$materialId} not found");
+                }
+                $gstTypes[] = $material->gst_type;
+            }
+            
+            // Check if all items have the same GST type
+            $uniqueGstTypes = array_unique($gstTypes);
+            if (count($uniqueGstTypes) > 1) {
+                DB::rollBack();
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot mix GST and Non-GST materials in the same Purchase Order. Please create separate POs for GST and Non-GST items.'
+                ], 422);
+            }
+            
+            // Auto-detect PO type from materials
+            $poType = $uniqueGstTypes[0]; // 'gst' or 'non_gst'
+
+            $poNumber = PurchaseOrder::generatePONumber();
+            
+            // Calculate totals
+            $totalAmount = 0;
+            $totalGstAmount = 0;
+
+            $itemsData = [];
+            foreach ($validated['items'] as $item) {
+                $material = $materials->get($item['material_id']);
+                $amount = $item['quantity'] * $item['rate'];
+                
+                // Use material's GST percentage if it's a GST material
+                $gstPercentage = $material->isGstApplicable() ? $material->gst_percentage : 0;
+                $gstAmount = ($amount * $gstPercentage) / 100;
+                
+                $totalAmount += $amount;
+                $totalGstAmount += $gstAmount;
+                
+                $itemsData[] = [
+                    'material' => $material,
+                    'quantity' => $item['quantity'],
+                    'unit' => $item['unit'],
+                    'rate' => $item['rate'],
+                    'amount' => $amount,
+                    'gst_percentage' => $gstPercentage,
+                    'gst_amount' => $gstAmount,
+                ];
+            }
+
+            $grandTotal = $totalAmount + $totalGstAmount;
+
+            // Create purchase order (supports mixed GST & Non-GST items)
+            $purchaseOrder = PurchaseOrder::create([
+                'po_number' => $poNumber,
+                'project_id' => $validated['project_id'],
+                'vendor_id' => $validated['vendor_id'],
+                'material_request_id' => $validated['material_request_id'] ?? null,
+                'created_by' => auth()->id(),
+                'status' => PurchaseOrder::STATUS_CREATED,
+                'total_amount' => $totalAmount,
+                'gst_amount' => $totalGstAmount,
+                'grand_total' => $grandTotal,
+            ]);
+
+            // Create purchase order items
+            foreach ($itemsData as $itemData) {
+                $totalItemAmount = $itemData['amount'] + $itemData['gst_amount'];
+                
+                $purchaseOrder->items()->create([
+                    'material_id' => $itemData['material']->id,
+                    'quantity' => $itemData['quantity'],
+                    'unit' => $itemData['unit'],
+                    'rate' => $itemData['rate'],
+                    'amount' => $itemData['amount'],
+                    'gst_percentage' => $itemData['gst_percentage'],
+                    'gst_amount' => $itemData['gst_amount'],
+                    'total_amount' => $totalItemAmount,
+                ]);
+            }
+
+            // Update material request status if linked
+            if ($validated['material_request_id']) {
+                $materialRequest = MaterialRequest::find($validated['material_request_id']);
+                if ($materialRequest && $materialRequest->status === MaterialRequest::STATUS_REVIEWED) {
+                    // Keep status as reviewed, PO created doesn't mean approved yet
+                }
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Purchase Order created successfully (supports mixed GST & Non-GST items)',
+                'data' => $purchaseOrder->load(['project', 'vendor', 'items.material'])
+            ], 201);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to create purchase order: ' . $e->getMessage()
+            ], 422);
+        }
+    }
+
+    /**
+     * Update purchase order status
+     */
+    public function updateStatus(Request $request, $id)
+    {
+        $purchaseOrder = PurchaseOrder::findOrFail($id);
+        $this->authorize('updateStatus', $purchaseOrder);
+
+        $validated = $request->validate([
+            'status' => 'required|in:created,approved,delivered,closed',
+        ]);
+
+        try {
+            DB::beginTransaction();
+
+            $purchaseOrder = PurchaseOrder::findOrFail($id);
+            
+            $purchaseOrder->status = $validated['status'];
+            
+            // Set timestamps based on status
+            if ($validated['status'] === PurchaseOrder::STATUS_APPROVED) {
+                $purchaseOrder->approved_at = now();
+
+                // PHASE 3: Create stock IN if invoice is already uploaded
+                if ($purchaseOrder->invoice_file && $purchaseOrder->invoice_number) {
+                    $stockService = new StockService();
+                    $stockTransactions = $stockService->createStockInFromPurchaseOrder(
+                        $purchaseOrder,
+                        $purchaseOrder->invoice_number,
+                        auth()->id()
+                    );
+
+                    $purchaseOrder->save();
+                    DB::commit();
+
+                    return response()->json([
+                        'success' => true,
+                        'message' => 'Purchase Order approved and stock IN transactions created successfully',
+                        'data' => $purchaseOrder,
+                        'stock_transactions' => count($stockTransactions)
+                    ]);
+                }
+            } elseif ($validated['status'] === PurchaseOrder::STATUS_DELIVERED) {
+                $purchaseOrder->delivered_at = now();
+                
+                // Auto-generate system invoice
+                if (!$purchaseOrder->invoice) {
+                    $this->generateInvoiceFromPO($purchaseOrder);
+                }
+            } elseif ($validated['status'] === PurchaseOrder::STATUS_CLOSED) {
+                $purchaseOrder->closed_at = now();
+            }
+            
+            $purchaseOrder->save();
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Purchase Order status updated successfully',
+                'data' => $purchaseOrder
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to update status: ' . $e->getMessage()
+            ], 422);
+        }
+    }
+
+    /**
+     * Upload vendor invoice
+     */
+    public function uploadInvoice(Request $request, $id)
+    {
+        $purchaseOrder = PurchaseOrder::findOrFail($id);
+        $this->authorize('uploadInvoice', $purchaseOrder);
+
+        $validated = $request->validate([
+            'invoice' => 'required|file|mimes:pdf,jpg,jpeg,png|max:5120', // 5MB max
+            'invoice_number' => 'required|string|max:100', // Invoice number for stock tracking
+        ]);
+
+        try {
+            DB::beginTransaction();
+
+            // Delete old invoice if exists
+            if ($purchaseOrder->invoice_file) {
+                Storage::disk('public')->delete($purchaseOrder->invoice_file);
+            }
+
+            // Store new invoice
+            $path = $request->file('invoice')->store('purchase_orders/invoices', 'public');
+            
+            $purchaseOrder->invoice_file = $path;
+            $purchaseOrder->invoice_number = $validated['invoice_number'];
+            $purchaseOrder->save();
+
+            // PHASE 3: Create stock IN transactions if PO is approved
+            if ($purchaseOrder->status === PurchaseOrder::STATUS_APPROVED) {
+                $stockService = new StockService();
+                $stockTransactions = $stockService->createStockInFromPurchaseOrder(
+                    $purchaseOrder,
+                    $validated['invoice_number'],
+                    auth()->id()
+                );
+
+                DB::commit();
+
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Invoice uploaded and stock IN transactions created successfully',
+                    'data' => $purchaseOrder,
+                    'stock_transactions' => count($stockTransactions)
+                ]);
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Invoice uploaded successfully. Stock will be added when PO is approved.',
+                'data' => $purchaseOrder
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to upload invoice: ' . $e->getMessage()
+            ], 422);
+        }
+    }
+
+    /**
+     * Delete purchase order
+     */
+    public function destroy($id)
+    {
+        $purchaseOrder = PurchaseOrder::findOrFail($id);
+        $this->authorize('delete', $purchaseOrder);
+
+        try {
+            
+            // Only allow deletion of created status POs
+            if ($purchaseOrder->status !== PurchaseOrder::STATUS_CREATED) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot delete purchase order with status: ' . $purchaseOrder->status
+                ], 422);
+            }
+
+            // Delete invoice file if exists
+            if ($purchaseOrder->invoice_file) {
+                Storage::disk('public')->delete($purchaseOrder->invoice_file);
+            }
+
+            $purchaseOrder->delete();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Purchase Order deleted successfully'
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to delete purchase order: ' . $e->getMessage()
+            ], 422);
+        }
+    }
+
+    /**
+     * Get invoice for a Purchase Order
+     */
+    public function getInvoice($id)
+    {
+        $purchaseOrder = PurchaseOrder::with(['invoice.items.material'])->findOrFail($id);
+        $this->authorize('view', $purchaseOrder);
+
+        if (!$purchaseOrder->invoice) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Invoice not yet generated. Invoice will be created when PO is delivered.'
+            ], 404);
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => $purchaseOrder->invoice
+        ]);
+    }
+
+    /**
+     * Generate system invoice from Purchase Order
+     */
+    private function generateInvoiceFromPO(PurchaseOrder $purchaseOrder)
+    {
+        // Create invoice
+        $invoice = Invoice::create([
+            'project_id' => $purchaseOrder->project_id,
+            'purchase_order_id' => $purchaseOrder->id,
+            'invoice_number' => $purchaseOrder->invoice_number ?? 'INV-' . $purchaseOrder->po_number,
+            'total_amount' => $purchaseOrder->grand_total,
+            'gst_amount' => $purchaseOrder->gst_amount,
+            'status' => Invoice::STATUS_GENERATED,
+        ]);
+
+        // Create invoice items from PO items
+        foreach ($purchaseOrder->items as $item) {
+            \App\Models\InvoiceItem::create([
+                'invoice_id' => $invoice->id,
+                'material_id' => $item->material_id,
+                'quantity' => $item->quantity,
+                'unit' => $item->unit,
+                'rate' => $item->rate,
+                'amount' => $item->amount,
+                'gst_percentage' => $item->gst_percentage,
+                'gst_amount' => $item->gst_amount,
+                'total_amount' => $item->total_amount,
+            ]);
+        }
+
+        return $invoice;
+    }
+}

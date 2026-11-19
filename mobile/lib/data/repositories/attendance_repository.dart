@@ -1,0 +1,421 @@
+import 'package:dio/dio.dart';
+import 'package:hive/hive.dart';
+import 'package:mobile/core/constants/api_constants.dart';
+import 'package:mobile/core/network/api_client.dart';
+import 'package:mobile/core/network/network_info.dart';
+import 'package:mobile/core/utils/app_logger.dart';
+import 'package:mobile/data/models/attendance_model.dart';
+import 'package:uuid/uuid.dart';
+
+class AttendanceRepository {
+  final ApiClient _apiClient;
+  final NetworkInfo _networkInfo;
+  final Box<AttendanceModel> _attendanceBox;
+  
+  AttendanceRepository(
+    this._apiClient,
+    this._networkInfo,
+    this._attendanceBox,
+  );
+  
+  Future<AttendanceModel> checkIn({
+    required int projectId,
+    required double latitude,
+    required double longitude,
+  }) async {
+    final date = DateTime.now().toIso8601String().split('T')[0];
+    final checkIn = DateTime.now().toIso8601String();
+    
+    // Check if already checked in today (from local storage)
+    final todayAttendance = _attendanceBox.values.firstWhere(
+      (a) => a.date == date,
+      orElse: () => AttendanceModel(
+        userId: 0,
+        projectId: 0,
+        date: '',
+        markedLatitude: 0,
+        markedLongitude: 0,
+      ),
+    );
+    
+    if (todayAttendance.date == date) {
+      throw Exception('Already checked in today');
+    }
+    
+    final isOnline = await _networkInfo.isConnected;
+    
+    if (isOnline) {
+      try {
+        final response = await _apiClient.post(
+          ApiConstants.attendanceCheckIn,
+          data: {
+            'project_id': projectId,
+            'latitude': latitude,
+            'longitude': longitude,
+          },
+        );
+        
+        final attendance = AttendanceModel.fromJson(response.data['data']);
+        await _attendanceBox.put(attendance.id, attendance);
+        return attendance;
+      } on DioException catch (e) {
+        AppLogger.error('Check-in failed', e);
+        // Extract validation errors if available
+        final errors = e.response?.data['errors'];
+        final message = e.response?.data['message'] ?? 'Check-in failed';
+        if (errors != null) {
+          final errorMessages = (errors as Map).values.map((e) => e.toString()).join(', ');
+          throw Exception('$message: $errorMessages');
+        }
+        throw Exception(message);
+      }
+    } else {
+      // Offline mode
+      final localId = const Uuid().v4();
+      final attendance = AttendanceModel(
+        userId: 0, // Will be filled during sync
+        projectId: projectId,
+        date: date,
+        checkIn: checkIn,
+        markedLatitude: latitude,
+        markedLongitude: longitude,
+        isSynced: false,
+        localId: localId,
+      );
+      
+      await _attendanceBox.put(localId, attendance);
+      AppLogger.info('Check-in saved offline');
+      return attendance;
+    }
+  }
+  
+  Future<AttendanceModel> checkOut({
+    required int attendanceId,
+    required double latitude,
+    required double longitude,
+  }) async {
+    final isOnline = await _networkInfo.isConnected;
+    
+    if (isOnline) {
+      try {
+        final response = await _apiClient.post(
+          '${ApiConstants.attendance}/$attendanceId/check-out',
+          data: {
+            'latitude': latitude,
+            'longitude': longitude,
+          },
+        );
+        
+        final attendance = AttendanceModel.fromJson(response.data['data']);
+        await _attendanceBox.put(attendance.id, attendance);
+        return attendance;
+      } on DioException catch (e) {
+        AppLogger.error('Check-out failed', e);
+        throw Exception(e.response?.data['message'] ?? 'Check-out failed');
+      }
+    } else {
+      // Offline mode
+      final localAttendance = _attendanceBox.get(attendanceId);
+      if (localAttendance != null) {
+        final updated = AttendanceModel(
+          id: localAttendance.id,
+          userId: localAttendance.userId,
+          projectId: localAttendance.projectId,
+          date: localAttendance.date,
+          checkIn: localAttendance.checkIn,
+          checkOut: DateTime.now().toIso8601String(),
+          markedLatitude: latitude,
+          markedLongitude: longitude,
+          isSynced: false,
+          localId: localAttendance.localId,
+        );
+        
+        await _attendanceBox.put(attendanceId, updated);
+        AppLogger.info('Check-out saved offline');
+        return updated;
+      }
+      throw Exception('Attendance record not found');
+    }
+  }
+  
+  Future<List<AttendanceModel>> getMyAttendance({int page = 1}) async {
+    final isOnline = await _networkInfo.isConnected;
+    
+    if (isOnline) {
+      try {
+        final response = await _apiClient.get(
+          ApiConstants.myAttendance,
+          queryParameters: {'page': page},
+        );
+        
+        final List<dynamic> data = response.data['data'] ?? [];
+        final attendances = data.map((json) => AttendanceModel.fromJson(json)).toList();
+        
+        // Update local cache - only if id is not null
+        for (var attendance in attendances) {
+          if (attendance.id != null) {
+            await _attendanceBox.put(attendance.id!, attendance);
+          }
+        }
+        
+        return attendances;
+      } catch (e) {
+        AppLogger.error('Failed to fetch attendance', e);
+        rethrow;
+      }
+    }
+    
+    // Return from local storage
+    return _attendanceBox.values.toList()
+      ..sort((a, b) => b.date.compareTo(a.date));
+  }
+
+  /// Get all attendance records (for owners)
+  Future<List<AttendanceModel>> getAllAttendance({int page = 1}) async {
+    final isOnline = await _networkInfo.isConnected;
+    
+    if (isOnline) {
+      try {
+        final response = await _apiClient.get(
+          ApiConstants.allAttendance,
+          queryParameters: {'page': page},
+        );
+        
+        final List<dynamic> data = response.data['data'] ?? [];
+        final attendances = data.map((json) => AttendanceModel.fromJson(json)).toList();
+        
+        // Update local cache - only if id is not null
+        for (var attendance in attendances) {
+          if (attendance.id != null) {
+            await _attendanceBox.put(attendance.id!, attendance);
+          }
+        }
+        
+        return attendances;
+      } catch (e) {
+        AppLogger.error('Failed to fetch all attendance', e);
+        rethrow;
+      }
+    }
+    
+    // Return from local storage
+    return _attendanceBox.values.toList()
+      ..sort((a, b) => b.date.compareTo(a.date));
+  }
+
+  /// Get all project attendance records (for owners/managers)
+  Future<List<AttendanceModel>> getProjectAttendance(int projectId, {int page = 1}) async {
+    final isOnline = await _networkInfo.isConnected;
+    
+    if (isOnline) {
+      try {
+        final response = await _apiClient.get(
+          '${ApiConstants.projectAttendance}/$projectId',
+          queryParameters: {'page': page},
+        );
+        
+        final List<dynamic> data = response.data['data'] ?? [];
+        final attendances = data.map((json) => AttendanceModel.fromJson(json)).toList();
+        
+        // Update local cache - only if id is not null
+        for (var attendance in attendances) {
+          if (attendance.id != null) {
+            await _attendanceBox.put(attendance.id!, attendance);
+          }
+        }
+        
+        return attendances;
+      } catch (e) {
+        AppLogger.error('Failed to fetch project attendance', e);
+        rethrow;
+      }
+    }
+    
+    // Return from local storage
+    return _attendanceBox.values.toList()
+      ..sort((a, b) => b.date.compareTo(a.date));
+  }
+  
+  Future<AttendanceModel?> getTodayAttendance() async {
+    final date = DateTime.now().toIso8601String().split('T')[0];
+    
+    // Always try to fetch from API first if online to get fresh data
+    final isOnline = await _networkInfo.isConnected;
+    if (isOnline) {
+      try {
+        final attendances = await getMyAttendance();
+        final todayAttendance = attendances.where((a) => a.date.split('T')[0] == date).firstOrNull;
+        if (todayAttendance != null) {
+          return todayAttendance;
+        }
+      } catch (e) {
+        AppLogger.error('Failed to fetch today attendance from API', e);
+        // Fall through to local storage
+      }
+    }
+    
+    // Fall back to local storage if offline or API call failed
+    final localAttendance = _attendanceBox.values
+        .where((a) => a.date.split('T')[0] == date)
+        .firstOrNull;
+    
+    return localAttendance;
+  }
+
+  /// Get today's attendance for a specific project
+  Future<AttendanceModel?> getTodayAttendanceForProject(int projectId) async {
+    final date = DateTime.now().toIso8601String().split('T')[0];
+    
+    // Always try to fetch from API first if online to get fresh data
+    final isOnline = await _networkInfo.isConnected;
+    if (isOnline) {
+      try {
+        final attendances = await getProjectAttendance(projectId);
+        final todayAttendance = attendances
+            .where((a) => a.date.split('T')[0] == date && a.projectId == projectId)
+            .firstOrNull;
+        if (todayAttendance != null) {
+          return todayAttendance;
+        }
+      } catch (e) {
+        AppLogger.error('Failed to fetch today attendance for project from API', e);
+        // Fall through to local storage
+      }
+    }
+    
+    // Fall back to local storage if offline or API call failed
+    final localAttendance = _attendanceBox.values
+        .where((a) => a.date.split('T')[0] == date && a.projectId == projectId)
+        .firstOrNull;
+    
+    return localAttendance;
+  }
+  
+  Future<void> syncPendingAttendance() async {
+    final unsyncedAttendance = _attendanceBox.values
+        .where((a) => !a.isSynced)
+        .toList();
+    
+    for (var attendance in unsyncedAttendance) {
+      try {
+        if (attendance.checkOut == null) {
+          // Sync check-in
+          final response = await _apiClient.post(
+            ApiConstants.attendanceCheckIn,
+            data: attendance.toJson(),
+          );
+          final synced = AttendanceModel.fromJson(response.data['data']);
+          await _attendanceBox.delete(attendance.localId);
+          await _attendanceBox.put(synced.id, synced);
+        } else {
+          // Sync check-out
+          final response = await _apiClient.post(
+            ApiConstants.attendanceCheckOut,
+            data: {
+              'marked_latitude': attendance.markedLatitude,
+              'marked_longitude': attendance.markedLongitude,
+            },
+          );
+          final synced = AttendanceModel.fromJson(response.data['data']);
+          await _attendanceBox.put(synced.id, synced);
+        }
+        AppLogger.info('Synced attendance: ${attendance.localId}');
+      } catch (e) {
+        AppLogger.error('Failed to sync attendance', e);
+      }
+    }
+  }
+
+  /// Get team attendance summary for a project (for managers)
+  Future<Map<String, dynamic>> getTeamAttendanceSummary(int projectId, {String? date}) async {
+    try {
+      final queryDate = date ?? DateTime.now().toIso8601String().split('T')[0];
+      final response = await _apiClient.get(
+        '/attendance/project/$projectId/team-summary?date=$queryDate',
+      );
+      return response.data['data'] as Map<String, dynamic>;
+    } catch (e) {
+      AppLogger.error('Failed to fetch team attendance summary', e);
+      rethrow;
+    }
+  }
+
+  /// Get attendance trends for a project
+  Future<Map<String, dynamic>> getAttendanceTrends(int projectId, {int days = 30}) async {
+    try {
+      final response = await _apiClient.get(
+        '/attendance/project/$projectId/trends?days=$days',
+      );
+      return response.data['data'] as Map<String, dynamic>;
+    } catch (e) {
+      AppLogger.error('Failed to fetch attendance trends', e);
+      rethrow;
+    }
+  }
+
+  /// Check-in with face verification
+  Future<void> checkInWithFace({
+    required int projectId,
+    required String facePath,
+    required double latitude,
+    required double longitude,
+  }) async {
+    try {
+      final formData = FormData.fromMap({
+        'project_id': projectId,
+        'face_image': await MultipartFile.fromFile(facePath),
+        'latitude': latitude,
+        'longitude': longitude,
+        'check_in_time': DateTime.now().toIso8601String(),
+      });
+
+      final response = await _apiClient.postFormData(
+        '/attendance/check-in-face',
+        formData,
+      );
+
+      if (!response.data['success']) {
+        throw Exception(response.data['message'] ?? 'Failed to check in');
+      }
+
+      AppLogger.info('Check-in with face verification successful');
+    } on DioException catch (e) {
+      AppLogger.error('Face check-in failed', e);
+      final message = e.response?.data['message'] ?? 'Failed to check in with face';
+      throw Exception(message);
+    }
+  }
+
+  /// Check-out with face verification
+  Future<void> checkOutWithFace({
+    required int projectId,
+    required String facePath,
+    required double latitude,
+    required double longitude,
+  }) async {
+    try {
+      final formData = FormData.fromMap({
+        'project_id': projectId,
+        'face_image': await MultipartFile.fromFile(facePath),
+        'latitude': latitude,
+        'longitude': longitude,
+        'check_out_time': DateTime.now().toIso8601String(),
+      });
+
+      final response = await _apiClient.postFormData(
+        '/attendance/check-out-face',
+        formData,
+      );
+
+      if (!response.data['success']) {
+        throw Exception(response.data['message'] ?? 'Failed to check out');
+      }
+
+      AppLogger.info('Check-out with face verification successful');
+    } on DioException catch (e) {
+      AppLogger.error('Face check-out failed', e);
+      final message = e.response?.data['message'] ?? 'Failed to check out with face';
+      throw Exception(message);
+    }
+  }
+}
