@@ -1,4 +1,4 @@
-# SiteTwin: A Construction Field Management System
+# SiteTwin: A Construction & Operations Management System
 
 A comprehensive enterprise resource planning (ERP) system for construction site management in India, featuring real-time procurement tracking, GPS-based attendance, safety compliance, and GST-compliant financial management.
 
